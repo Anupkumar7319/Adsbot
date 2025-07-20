@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Admin – Ads</h2>
+<table>
+  <tr><th>Title</th><th>Reward</th><th>Active</th><th>Actions</th></tr>
+  {% for ad in ads %}
+  <tr>
+    <td>{{ ad.title }}</td>
+    <td>{{ ad.reward_coins }}</td>
+    <td>{{ 'Yes' if ad.active else 'No' }}</td>
+    <td>
+      {% if ad.active %}
+      <a href="/admin/ads/off/{{ ad._id }}">Disable</a>
+      {% else %}
+      <a href="/admin/ads/on/{{ ad._id }}">Enable</a>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<hr>
+<h3>Add New Ad</h3>
+<form method="post" action="/admin/ads/add">
+  <p>Title: <input name="title"></p>
+  <p>Video URL: <input name="video_url"></p>
+  <p>Reward Coins: <input name="reward" value="5"></p>
+  <button type="submit">Add Ad</button>
+</form>
+{% endblock %}
+
+
+---
