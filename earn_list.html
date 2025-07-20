@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Available Ads</h2>
+<ul>
+  {% for ad in ads %}
+    <li>
+      {{ ad.title }} (+{{ ad.reward_coins }}c)
+      <a href="/watch/{{ user_id }}/{{ ad._id }}">Watch</a>
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}
