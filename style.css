@@ -1,0 +1,8 @@
+body { font-family: sans-serif; background:#f7f7f7; margin:0; padding:0; }
+.container { max-width:480px; margin:0 auto; padding:1rem; background:#fff; box-shadow:0 0 5px rgba(0,0,0,0.1); }
+h2 { margin-top:0; }
+video { max-width:100%; height:auto; }
+#status { margin-top:1rem; font-weight:bold; }
+
+
+---
