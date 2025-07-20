@@ -1,0 +1,60 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>{{ ad.title }}</h2>
+{% if ad.type == 'video' and ad.video_url %}
+  <video id="adVideo" width="100%" controls playsinline>
+    <source src="{{ ad.video_url }}" type="video/mp4">
+  </video>
+  <p>Watch fully to earn {{ ad.reward_coins }} coins.</p>
+{% elif ad.type == 'link' %}
+  <p>Open the sponsor page below and stay for a bit to earn {{ ad.reward_coins }} coins.</p>
+  <a id="adLink" href="{{ ad.landing_url }}" target="_blank">Open Sponsor</a>
+{% else %}
+  <p>Unknown ad type.</p>
+{% endif %}
+<p id="status"></p>
+<script>
+  const token = {{ token|tojson }};
+  let credited = false;
+
+  function credit(progress){
+    if(credited) return;
+    fetch('/api/credit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token, progress: progress})
+    }).then(r=>r.json()).then(j=>{
+      if(j.ok){
+        credited = true;
+        document.getElementById('status').innerText = `You earned ${j.reward} coins! You can close this page.`;
+      } else {
+        document.getElementById('status').innerText = 'Not credited: '+j.error;
+      }
+    }).catch(()=>{
+      document.getElementById('status').innerText = 'Network error.';
+    });
+  }
+
+  const vid = document.getElementById('adVideo');
+  if(vid){
+    vid.addEventListener('timeupdate', ()=>{
+      const p = vid.currentTime / vid.duration;
+      if(p >= 0.8){ // 80% watched
+        credit(p);
+      }
+    });
+    vid.addEventListener('ended', ()=>credit(1));
+  }
+
+  const lnk = document.getElementById('adLink');
+  if(lnk){
+    lnk.addEventListener('click', ()=>{
+      // naive 5 second timer credit for link type
+      setTimeout(()=>credit(1), 5000);
+    });
+  }
+</script>
+{% endblock %}
+
+
+---
