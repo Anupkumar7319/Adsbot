@@ -1,0 +1,1333 @@
+Watch Ads & Earn – Telegram Bot Full Code Pack
+
+> Bilingual (Hindi/English) reward bot: users watch sponsor videos (or click ads) via a Telegram inline button/WebApp page and earn coins that can be withdrawn (manual UPI review). Built with Pyrogram + Flask + MongoDB Atlas. Deployable on Render (or any VM / VPS / Heroku-alt).
+
+
+
+
+---
+
+📁 Project Structure
+
+watch_ads_earn_bot/
+├─ main.py                # Entry point: starts Flask + Pyrogram bot
+├─ bot_handlers.py        # All Telegram command handlers & callbacks
+├─ web_routes.py          # Flask routes: ad viewing, credit API, admin UI
+├─ config.py              # Loads env vars, constants, helper config
+├─ db.py                  # MongoDB connection + wrapper helpers
+├─ models.py              # CRUD functions for users, ads, impressions, withdrawals
+├─ messages.py            # Centralized bilingual user-facing text strings
+├─ security.py            # HMAC signing + token utilities to prevent fake rewards
+├─ utils.py               # Misc helpers (time, formatting, currency conv)
+├─ requirements.txt       # Python deps
+├─ Procfile               # For Render / Heroku style Proc
+├─ runtime.txt            # Python runtime pin (optional for some hosts)
+├─ render.yaml            # Render deploy spec (web service + worker)
+├─ .env.example           # Sample env file; copy -> .env and fill secrets
+├─ README.md              # Full setup & deploy guide
+├─ templates/
+│  ├─ base.html
+│  ├─ ad_page.html        # WebApp ad player
+│  ├─ earn_list.html      # List of ads to pick from
+│  └─ admin_ads.html      # Quick & dirty admin panel
+└─ static/
+   └─ style.css
+
+
+---
+
+1. config.py
+
+"""Configuration loader for Watch Ads & Earn Bot.
+Reads environment variables, applies defaults, and exposes structured config.
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # loads from .env if present
+
+# --- Required Telegram credentials ---
+API_ID = int(os.getenv("API_ID", 0))          # e.g. 123456
+API_HASH = os.getenv("API_HASH", "")          # e.g. 'abcd1234...'
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")        # BotFather token
+
+# --- MongoDB ---
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "earn_bot")
+
+# --- Web / Hosting ---
+# Public base URL where your Flask app is reachable (Render/GCP/etc.)
+# Example: https://your-app.onrender.com
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")
+
+# Used to sign reward tokens so users can't fake API calls
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-please")
+
+# Admin Telegram user IDs (comma-separated list of integers)
+_admin_ids = os.getenv("ADMIN_IDS", "").strip()
+if _admin_ids:
+    ADMIN_IDS = {int(x) for x in _admin_ids.split(",") if x.strip().isdigit()}
+else:
+    ADMIN_IDS = set()
+
+# Coin ↔ INR conversion (configurable) – *NOT* an actual payment rate!
+COIN_TO_INR = float(os.getenv("COIN_TO_INR", "0.10"))  # 1 coin = ₹0.10 default
+
+# Reward per completed ad view *default* (campaigns can override)
+DEFAULT_AD_REWARD = int(os.getenv("DEFAULT_AD_REWARD", 5))
+
+# Anti-fraud controls
+DAILY_AD_WATCH_LIMIT = int(os.getenv("DAILY_AD_WATCH_LIMIT", 20))
+AD_COOLDOWN_SECONDS = int(os.getenv("AD_COOLDOWN_SECONDS", 60))  # min gap between same campaign
+
+# Withdrawal constraints
+MIN_WITHDRAW_COINS = int(os.getenv("MIN_WITHDRAW_COINS", 500))
+WITHDRAW_BATCH_REVIEW_HOURS = int(os.getenv("WITHDRAW_BATCH_REVIEW_HOURS", 24))
+
+# Language settings
+# auto|en|hi  → auto = detect from user language_code; fallback en
+LANG_MODE = os.getenv("LANG_MODE", "auto").lower()
+
+# Force join (optional) – require user to join these channels before earning
+# Comma-separated @usernames (without https://t.me/)
+_force_join = os.getenv("FORCE_JOIN_CHANNELS", "").strip()
+FORCE_JOIN_CHANNELS = [x.strip().lstrip("@") for x in _force_join.split(",") if x.strip()]
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+class Config:
+    api_id = API_ID
+    api_hash = API_HASH
+    bot_token = BOT_TOKEN
+    mongo_uri = MONGO_URI
+    mongo_db = MONGO_DB_NAME
+    base_url = BASE_URL
+    secret_key = SECRET_KEY
+    admin_ids = ADMIN_IDS
+    coin_to_inr = COIN_TO_INR
+    default_ad_reward = DEFAULT_AD_REWARD
+    daily_ad_watch_limit = DAILY_AD_WATCH_LIMIT
+    ad_cooldown_seconds = AD_COOLDOWN_SECONDS
+    min_withdraw_coins = MIN_WITHDRAW_COINS
+    withdraw_batch_review_hours = WITHDRAW_BATCH_REVIEW_HOURS
+    lang_mode = LANG_MODE
+    force_join_channels = FORCE_JOIN_CHANNELS
+    log_level = LOG_LEVEL
+
+CONFIG = Config()
+
+
+---
+
+2. db.py
+
+"""MongoDB connection + standard collections.
+Create indexes on first import.
+"""
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from datetime import datetime
+from config import CONFIG
+
+_client = MongoClient(CONFIG.mongo_uri)
+db = _client[CONFIG.mongo_db]
+
+# Collections
+users_col = db["users"]
+ads_col = db["ads"]
+impressions_col = db["impressions"]
+withdrawals_col = db["withdrawals"]
+logs_col = db["logs"]
+
+# Ensure indexes (idempotent)
+users_col.create_index([("created_at", DESCENDING)])
+users_col.create_index([("username", ASCENDING)])
+
+ads_col.create_index([("active", ASCENDING)])
+ads_col.create_index([("title", ASCENDING)])
+
+impressions_col.create_index([("user_id", ASCENDING), ("campaign_id", ASCENDING), ("completed_at", DESCENDING)])
+impressions_col.create_index([("created_at", DESCENDING)])
+
+withdrawals_col.create_index([("user_id", ASCENDING), ("status", ASCENDING)])
+withdrawals_col.create_index([("requested_at", DESCENDING)])
+
+# Basic heartbeat
+if not db.command("ping"):
+    raise RuntimeError("MongoDB ping failed")
+
+
+def now_utc():
+    return datetime.utcnow()
+
+
+---
+
+3. models.py
+
+"""Database-facing helper functions.
+All write ops centralized here so logic is easier to audit.
+"""
+from datetime import datetime, timedelta
+from bson import ObjectId
+from db import users_col, ads_col, impressions_col, withdrawals_col, now_utc
+from config import CONFIG
+
+# -----------------
+# USERS
+# -----------------
+
+def get_or_create_user(user_id: int, username: str = None, lang: str = "en"):
+    doc = users_col.find_one({'_id': user_id})
+    if doc:
+        return doc
+    new_doc = {
+        '_id': user_id,
+        'username': username,
+        'lang': lang,
+        'coins': 0,
+        'total_earned': 0,
+        'referrer': None,
+        'created_at': now_utc(),
+        'last_ad_watch': None,
+        'watch_counts': {},   # date string YYYY-MM-DD -> count
+    }
+    users_col.insert_one(new_doc)
+    return new_doc
+
+
+def get_user(user_id: int):
+    return users_col.find_one({'_id': user_id})
+
+
+def add_coins(user_id: int, coins: int):
+    update = {
+        '$inc': {'coins': coins, 'total_earned': coins},
+        '$set': {'last_ad_watch': now_utc()}
+    }
+    users_col.update_one({'_id': user_id}, update, upsert=True)
+
+
+def deduct_coins(user_id: int, coins: int) -> bool:
+    user = get_user(user_id)
+    if not user or user.get('coins', 0) < coins:
+        return False
+    users_col.update_one({'_id': user_id}, {'$inc': {'coins': -coins}})
+    return True
+
+
+def increment_watch_count(user_id: int):
+    today = now_utc().strftime('%Y-%m-%d')
+    users_col.update_one({'_id': user_id}, {'$inc': {f'watch_counts.{today}': 1}})
+
+
+def get_today_watch_count(user_id: int) -> int:
+    user = get_user(user_id)
+    if not user:
+        return 0
+    today = now_utc().strftime('%Y-%m-%d')
+    return user.get('watch_counts', {}).get(today, 0)
+
+# -----------------
+# ADS
+# -----------------
+
+def create_ad(title: str, ad_type: str = 'video', reward_coins: int = None, video_url: str = None,
+              landing_url: str = None, daily_cap: int = 0, active: bool = True, cooldown_seconds: int = None):
+    doc = {
+        'title': title,
+        'type': ad_type,  # video|link|cpa
+        'reward_coins': reward_coins if reward_coins is not None else CONFIG.default_ad_reward,
+        'video_url': video_url,
+        'landing_url': landing_url,
+        'daily_cap': daily_cap,  # 0 = unlimited
+        'active': active,
+        'cooldown_seconds': cooldown_seconds if cooldown_seconds is not None else CONFIG.ad_cooldown_seconds,
+        'created_at': now_utc(),
+    }
+    res = ads_col.insert_one(doc)
+    return str(res.inserted_id)
+
+
+def get_active_ads():
+    return list(ads_col.find({'active': True}))
+
+
+def get_ad(ad_id: str):
+    try:
+        oid = ObjectId(ad_id)
+    except Exception:
+        return None
+    return ads_col.find_one({'_id': oid})
+
+
+def set_ad_active(ad_id: str, active: bool):
+    oid = ObjectId(ad_id)
+    ads_col.update_one({'_id': oid}, {'$set': {'active': active}})
+
+# -----------------
+# IMPRESSIONS
+# -----------------
+
+def record_impression(user_id: int, campaign_id: str, started: datetime = None):
+    if started is None:
+        started = now_utc()
+    doc = {
+        'user_id': user_id,
+        'campaign_id': campaign_id,
+        'created_at': started,
+        'completed_at': None,
+        'rewarded': False,
+    }
+    res = impressions_col.insert_one(doc)
+    return str(res.inserted_id)
+
+
+def mark_impression_completed(impression_id: str):
+    oid = ObjectId(impression_id)
+    impressions_col.update_one({'_id': oid}, {'$set': {'completed_at': now_utc()}})
+
+
+def reward_impression(impression_id: str, user_id: int, coins: int):
+    oid = ObjectId(impression_id)
+    impressions_col.update_one({'_id': oid}, {'$set': {'rewarded': True, 'rewarded_at': now_utc(), 'reward_coins': coins}})
+    add_coins(user_id, coins)
+    increment_watch_count(user_id)
+
+
+def last_completed_for_campaign(user_id: int, campaign_id: str):
+    doc = impressions_col.find_one({'user_id': user_id, 'campaign_id': campaign_id, 'completed_at': {'$ne': None}}, sort=[('completed_at', -1)])
+    return doc
+
+# -----------------
+# WITHDRAWALS
+# -----------------
+
+def create_withdrawal(user_id: int, amount_coins: int, upi_id: str):
+    doc = {
+        'user_id': user_id,
+        'amount_coins': amount_coins,
+        'amount_inr': round(amount_coins * CONFIG.coin_to_inr, 2),
+        'upi_id': upi_id,
+        'status': 'pending',  # pending|paid|rejected
+        'requested_at': now_utc(),
+        'processed_at': None,
+    }
+    res = withdrawals_col.insert_one(doc)
+    return str(res.inserted_id)
+
+
+def list_withdrawals(status: str = None, limit: int = 100):
+    q = {}
+    if status:
+        q['status'] = status
+    return list(withdrawals_col.find(q).sort('requested_at', -1).limit(limit))
+
+
+def update_withdrawal_status(withdraw_id: str, status: str):
+    oid = ObjectId(withdraw_id)
+    withdrawals_col.update_one({'_id': oid}, {'$set': {'status': status, 'processed_at': now_utc()}})
+
+
+def get_user_withdrawals(user_id: int, limit: int = 20):
+    return list(withdrawals_col.find({'user_id': user_id}).sort('requested_at', -1).limit(limit))
+
+
+---
+
+4. messages.py
+
+"""Central bilingual message strings.
+Add/modify translations easily.
+"""
+from config import CONFIG
+
+# English strings
+EN = {
+    'welcome': "👋 Welcome! Use /earn to watch ads and earn coins.",
+    'force_join': "Please join the required channel(s) before earning:",
+    'joined_check': "Tap after joining:",
+    'earn_button': "Watch Ad & Earn",
+    'no_ads': "No ads available right now. Please try again later.",
+    'balance': "💰 Your balance: {coins} coins (~₹{inr})",
+    'daily_limit': "You've reached today's watch limit. Come back tomorrow!",
+    'cooldown': "Please wait {secs}s before watching this ad again.",
+    'watch_ack': "Ad completed! You earned {coins} coins.",
+    'withdraw_usage': "Usage: /withdraw <coins> <UPI_ID>\nExample: /withdraw 500 user@upi",
+    'withdraw_min': "Minimum withdrawal is {minc} coins.",
+    'withdraw_not_enough': "You don't have that many coins.",
+    'withdraw_ok': "Withdrawal requested: {coins} coins (~₹{inr}). We'll review soon.",
+    'admin_only': "This command is for admins only.",
+    'ad_added': "Ad added with id: {ad_id}",
+    'ad_activated': "Ad activated.",
+    'ad_deactivated': "Ad deactivated.",
+    'stats_head': "📊 Stats",
+    'withdraw_list_head': "Pending withdrawals:",
+}
+
+# Hindi strings (simple conversational tone)
+HI = {
+    'welcome': "👋 स्वागत है! /earn दबाकर विज्ञापन देखो और कॉइन कमाओ।",
+    'force_join': "कमाने से पहले इन चैनल्स को जॉइन करें:",
+    'joined_check': "जॉइन करने के बाद टैप करें:",
+    'earn_button': "Ad Dekho, Coin Kamao",
+    'no_ads': "अभी कोई विज्ञापन उपलब्ध नहीं है। बाद में कोशिश करें।",
+    'balance': "💰 आपका बैलेंस: {coins} कॉइन (लगभग ₹{inr})",
+    'daily_limit': "आज का लिमिट पूरा हो गया। कल दोबारा आएं!",
+    'cooldown': "कृपया {secs} सेकंड रुकें फिर ये विज्ञापन देखें।",
+    'watch_ack': "Ad पूरा देखा! आपको {coins} कॉइन मिले।",
+    'withdraw_usage': "ऐसे करें: /withdraw <कॉइन> <UPI_ID>\nउदाहरण: /withdraw 500 user@upi",
+    'withdraw_min': "कम से कम {minc} कॉइन चाहिए।",
+    'withdraw_not_enough': "आपके पास इतने कॉइन नहीं हैं।",
+    'withdraw_ok': "निकासी रिक्वेस्ट भेजी गई: {coins} कॉइन (~₹{inr}). हम जल्दी प्रोसेस करेंगे।",
+    'admin_only': "यह कमांड सिर्फ एडमिन के लिए है।",
+    'ad_added': "Ad add हो गया: {ad_id}",
+    'ad_activated': "Ad चालू किया गया।",
+    'ad_deactivated': "Ad बंद किया गया।",
+    'stats_head': "📊 आँकड़े",
+    'withdraw_list_head': "पेंडिंग निकासी:",
+}
+
+
+LANG_MAP = {'en': EN, 'hi': HI}
+
+
+def pick_lang(user_lang_code: str = None):
+    """Return language dict based on CONFIG.lang_mode & user preference."""
+    if CONFIG.lang_mode == 'en':
+        return EN
+    if CONFIG.lang_mode == 'hi':
+        return HI
+    # auto
+    if user_lang_code and user_lang_code.lower().startswith('hi'):
+        return HI
+    return EN
+
+
+---
+
+5. security.py
+
+"""Security helpers: sign/verify reward tokens so users can't spoof rewards."""
+import hmac
+import hashlib
+import base64
+import json
+import time
+from typing import Optional, Tuple
+from config import CONFIG
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip('=')
+
+
+def _b64d(data: str) -> bytes:
+    pad = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + pad)
+
+
+def sign_reward_token(user_id: int, campaign_id: str, impression_id: str, ttl_seconds: int = 600) -> str:
+    payload = {
+        'u': user_id,
+        'c': campaign_id,
+        'i': impression_id,
+        'exp': int(time.time()) + ttl_seconds,
+    }
+    raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode()
+    sig = hmac.new(CONFIG.secret_key.encode(), raw, hashlib.sha256).digest()
+    return _b64(raw) + '.' + _b64(sig)
+
+
+def verify_reward_token(token: str) -> Optional[Tuple[int, str, str]]:
+    try:
+        raw_b64, sig_b64 = token.split('.')
+    except ValueError:
+        return None
+    raw = _b64d(raw_b64)
+    expected_sig = hmac.new(CONFIG.secret_key.encode(), raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected_sig, _b64d(sig_b64)):
+        return None
+    import json, time
+    payload = json.loads(raw)
+    if payload.get('exp', 0) < time.time():
+        return None
+    return payload['u'], payload['c'], payload['i']
+
+
+---
+
+6. utils.py
+
+"""Utility helpers."""
+from config import CONFIG
+
+
+def coins_to_inr(coins: int) -> float:
+    return round(coins * CONFIG.coin_to_inr, 2)
+
+
+def parse_withdraw_args(text: str):
+    """Parse '/withdraw 500 user@upi' -> (500, 'user@upi')"""
+    parts = text.strip().split()
+    if len(parts) < 3:
+        return None, None
+    try:
+        amt = int(parts[1])
+    except ValueError:
+        return None, None
+    upi = parts[2]
+    return amt, upi
+
+
+---
+
+7. web_routes.py
+
+"""Flask routes for ad rendering & reward callback."""
+from flask import Blueprint, request, render_template, abort, jsonify
+from bson import ObjectId
+from config import CONFIG
+from models import get_ad, mark_impression_completed, reward_impression, last_completed_for_campaign
+from models import get_user, get_today_watch_count, record_impression
+from security import sign_reward_token, verify_reward_token
+
+web_bp = Blueprint('web', __name__)
+
+
+@web_bp.route('/')
+def home():
+    return "OK - Watch Ads & Earn Bot backend running"
+
+
+@web_bp.route('/watch/<int:user_id>/<ad_id>')
+def watch_ad(user_id, ad_id):
+    # Validate ad exists & active
+    ad = get_ad(ad_id)
+    if not ad or not ad.get('active', False):
+        abort(404)
+
+    # Create impression at open time
+    impression_id = record_impression(user_id, ad_id)
+
+    # Sign token for JS credit callback
+    token = sign_reward_token(user_id, ad_id, impression_id)
+
+    return render_template(
+        'ad_page.html',
+        title=ad.get('title', 'Ad'),
+        ad=ad,
+        user_id=user_id,
+        token=token,
+    )
+
+
+@web_bp.route('/api/credit', methods=['POST'])
+def api_credit():
+    data = request.json or {}
+    token = data.get('token')
+    progress = float(data.get('progress', 0))  # 0-1 video completion
+
+    tup = verify_reward_token(token)
+    if not tup:
+        return jsonify({'ok': False, 'error': 'bad_token'}), 400
+    user_id, campaign_id, impression_id = tup
+
+    ad = get_ad(campaign_id)
+    if not ad:
+        return jsonify({'ok': False, 'error': 'ad_missing'}), 404
+
+    # Has user hit daily limit?
+    if get_today_watch_count(user_id) >= CONFIG.daily_ad_watch_limit:
+        return jsonify({'ok': False, 'error': 'daily_limit'}), 403
+
+    # Per-campaign cooldown
+    last = last_completed_for_campaign(user_id, campaign_id)
+    if last and last.get('completed_at'):
+        from datetime import datetime, timezone
+        cooldown = ad.get('cooldown_seconds', CONFIG.ad_cooldown_seconds)
+        if (datetime.now(timezone.utc) - last['completed_at']).total_seconds() < cooldown:
+            return jsonify({'ok': False, 'error': 'cooldown'}), 403
+
+    # Require at least 80% progress to credit
+    if progress < 0.8:
+        return jsonify({'ok': False, 'error': 'not_complete'}), 400
+
+    # Mark & reward
+    mark_impression_completed(impression_id)
+    reward_impression(impression_id, user_id, ad.get('reward_coins'))
+    return jsonify({'ok': True, 'reward': ad.get('reward_coins')})
+
+
+---
+
+8. bot_handlers.py
+
+"""All Telegram bot handlers (Pyrogram)."""
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import CONFIG
+from models import (
+    get_or_create_user, get_user, get_active_ads, get_ad, set_ad_active,
+    create_ad, create_withdrawal, get_today_watch_count, deduct_coins,
+    list_withdrawals, update_withdrawal_status
+)
+from messages import pick_lang
+from utils import coins_to_inr, parse_withdraw_args
+
+
+# --------------
+# Force Join Check
+# --------------
+async def _user_in_required_channels(app: Client, user_id: int) -> bool:
+    if not CONFIG.force_join_channels:
+        return True
+    for chan in CONFIG.force_join_channels:
+        try:
+            member = await app.get_chat_member(chan, user_id)
+            if member.status in ("kicked", "left"):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _force_join_markup():
+    rows = []
+    for chan in CONFIG.force_join_channels:
+        rows.append([InlineKeyboardButton(f"@{chan}", url=f"https://t.me/{chan}")])
+    rows.append([InlineKeyboardButton("Joined ✅", callback_data="fjchk")])
+    return InlineKeyboardMarkup(rows)
+
+
+# --------------
+# /start
+# --------------
+async def start_handler(app: Client, message):
+    user = get_or_create_user(message.from_user.id, username=message.from_user.username, lang=message.from_user.language_code)
+    lang = pick_lang(user.get('lang'))
+
+    if not await _user_in_required_channels(app, message.from_user.id):
+        await message.reply(lang['force_join'], reply_markup=_force_join_markup())
+        return
+
+    coins = user.get('coins', 0)
+    await message.reply(lang['welcome'] + "\n" + lang['balance'].format(coins=coins, inr=coins_to_inr(coins)))
+
+
+# --------------
+# Force Join Callback
+# --------------
+async def fjchk_cb(app: Client, callback_query):
+    user_id = callback_query.from_user.id
+    user = get_user(user_id) or get_or_create_user(user_id)
+    lang = pick_lang(user.get('lang'))
+
+    if not await _user_in_required_channels(app, user_id):
+        await callback_query.answer("Still not joined.", show_alert=True)
+        return
+    await callback_query.message.edit_text(lang['welcome'])
+
+
+# --------------
+# /balance
+# --------------
+async def balance_handler(app: Client, message):
+    user = get_user(message.from_user.id)
+    if not user:
+        user = get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.language_code)
+    lang = pick_lang(user.get('lang'))
+    coins = user.get('coins', 0)
+    await message.reply(lang['balance'].format(coins=coins, inr=coins_to_inr(coins)))
+
+
+# --------------
+# /earn – show one (first) active ad, with button to watch
+# --------------
+async def earn_handler(app: Client, message):
+    user = get_user(message.from_user.id) or get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.language_code)
+    lang = pick_lang(user.get('lang'))
+
+    if not await _user_in_required_channels(app, message.from_user.id):
+        await message.reply(lang['force_join'], reply_markup=_force_join_markup())
+        return
+
+    if get_today_watch_count(message.from_user.id) >= CONFIG.daily_ad_watch_limit:
+        await message.reply(lang['daily_limit'])
+        return
+
+    ads = get_active_ads()
+    if not ads:
+        await message.reply(lang['no_ads'])
+        return
+
+    ad = ads[0]
+    url = f"{CONFIG.base_url}/watch/{message.from_user.id}/{ad['_id']}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(lang['earn_button'], url=url)]])
+    await message.reply(f"{ad['title']}\nReward: {ad.get('reward_coins')} coins", reply_markup=kb)
+
+
+# --------------
+# /earnlist – show multiple ads
+# --------------
+async def earnlist_handler(app: Client, message):
+    user = get_user(message.from_user.id) or get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.language_code)
+    lang = pick_lang(user.get('lang'))
+    ads = get_active_ads()
+    if not ads:
+        await message.reply(lang['no_ads'])
+        return
+    rows = []
+    for ad in ads:
+        url = f"{CONFIG.base_url}/watch/{message.from_user.id}/{ad['_id']}"
+        rows.append([InlineKeyboardButton(f"{ad['title']} (+{ad.get('reward_coins')}c)", url=url)])
+    await message.reply(lang['earn_button'], reply_markup=InlineKeyboardMarkup(rows))
+
+
+# --------------
+# /withdraw <coins> <UPI>
+# --------------
+async def withdraw_handler(app: Client, message):
+    user = get_user(message.from_user.id) or get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.language_code)
+    lang = pick_lang(user.get('lang'))
+
+    amt, upi = parse_withdraw_args(message.text)
+    if not amt or not upi:
+        await message.reply(lang['withdraw_usage'])
+        return
+    if amt < CONFIG.min_withdraw_coins:
+        await message.reply(lang['withdraw_min'].format(minc=CONFIG.min_withdraw_coins))
+        return
+    if user.get('coins', 0) < amt:
+        await message.reply(lang['withdraw_not_enough'])
+        return
+
+    if not deduct_coins(user['_id'], amt):
+        await message.reply(lang['withdraw_not_enough'])
+        return
+
+    wid = create_withdrawal(user['_id'], amt, upi)
+    await message.reply(lang['withdraw_ok'].format(coins=amt, inr=amt * CONFIG.coin_to_inr))
+
+    # Notify admins
+    for admin_id in CONFIG.admin_ids:
+        try:
+            await app.send_message(admin_id, f"New withdrawal request {wid} from {user['_id']} {amt} coins ({amt * CONFIG.coin_to_inr} INR) UPI: {upi}")
+        except Exception:
+            pass
+
+
+# -----------------
+# ADMIN COMMANDS
+# -----------------
+async def _is_admin(user_id: int) -> bool:
+    return user_id in CONFIG.admin_ids
+
+
+async def adsadmin_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    ads = get_active_ads()
+    txt = "Active Ads:\n" + "\n".join([f"{a['_id']} - {a['title']} ({a.get('reward_coins')}c)" for a in ads])
+    txt += "\n\nAdd ad: /addad <title>|<reward>|<video_url>"
+    await message.reply(txt)
+
+
+async def addad_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    # Parse simple pipe format
+    try:
+        _, rest = message.text.split(' ', 1)
+        title, reward, video_url = rest.split('|', 2)
+        reward = int(reward)
+    except Exception:
+        await message.reply("Usage: /addad title|reward|video_url")
+        return
+    ad_id = create_ad(title=title.strip(), ad_type='video', reward_coins=reward, video_url=video_url.strip(), landing_url=None)
+    await message.reply(f"Ad created: {ad_id}")
+
+
+async def disablead_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /disablead <id>")
+        return
+    set_ad_active(parts[1], False)
+    await message.reply("Ad disabled.")
+
+
+async def enablead_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /enablead <id>")
+        return
+    set_ad_active(parts[1], True)
+    await message.reply("Ad enabled.")
+
+
+async def list_withdraw_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    pend = list_withdrawals(status='pending', limit=50)
+    if not pend:
+        await message.reply("No pending withdrawals.")
+        return
+    lines = []
+    for w in pend:
+        lines.append(f"{w['_id']} user:{w['user_id']} {w['amount_coins']}c ({w['amount_inr']} INR) UPI:{w['upi_id']}")
+    await message.reply("\n".join(lines) + "\n\nPay: /pay <id> | Reject: /reject <id>")
+
+
+async def pay_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /pay <withdraw_id>")
+        return
+    wid = parts[1]
+    update_withdrawal_status(wid, 'paid')
+    await message.reply(f"Marked paid: {wid}")
+
+
+async def reject_handler(app: Client, message):
+    if not await _is_admin(message.from_user.id):
+        await message.reply("Not admin.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /reject <withdraw_id>")
+        return
+    wid = parts[1]
+    update_withdrawal_status(wid, 'rejected')
+    await message.reply(f"Rejected: {wid}")
+
+
+---
+
+9. main.py
+
+"""Entry point: start both Flask web app and Pyrogram bot.
+On Render (single web service) we run Flask, and start bot in background async task.
+"""
+import asyncio
+import threading
+from flask import Flask
+from pyrogram import Client, filters
+
+from config import CONFIG
+from web_routes import web_bp
+from bot_handlers import (
+    start_handler, fjchk_cb, balance_handler, earn_handler, earnlist_handler,
+    withdraw_handler, adsadmin_handler, addad_handler, disablead_handler,
+    enablead_handler, list_withdraw_handler, pay_handler, reject_handler
+)
+
+app = Flask(__name__)
+app.register_blueprint(web_bp)
+
+# Create Pyrogram Client
+bot = Client(
+    name="watch_ads_earn_bot",
+    api_id=CONFIG.api_id,
+    api_hash=CONFIG.api_hash,
+    bot_token=CONFIG.bot_token,
+    in_memory=True,
+)
+
+# --- Register Handlers ---
+@bot.on_message(filters.command("start"))
+async def _start(c, m):
+    await start_handler(c, m)
+
+@bot.on_callback_query(filters.regex("^fjchk$"))
+async def _fjchk(c, q):
+    await fjchk_cb(c, q)
+
+@bot.on_message(filters.command("balance"))
+async def _bal(c, m):
+    await balance_handler(c, m)
+
+@bot.on_message(filters.command("earn"))
+async def _earn(c, m):
+    await earn_handler(c, m)
+
+@bot.on_message(filters.command("earnlist"))
+async def _earnlist(c, m):
+    await earnlist_handler(c, m)
+
+@bot.on_message(filters.command("withdraw"))
+async def _wd(c, m):
+    await withdraw_handler(c, m)
+
+@bot.on_message(filters.command("adsadmin"))
+async def _adsadmin(c, m):
+    await adsadmin_handler(c, m)
+
+@bot.on_message(filters.command("addad"))
+async def _addad(c, m):
+    await addad_handler(c, m)
+
+@bot.on_message(filters.command("disablead"))
+async def _disablead(c, m):
+    await disablead_handler(c, m)
+
+@bot.on_message(filters.command("enablead"))
+async def _enablead(c, m):
+    await enablead_handler(c, m)
+
+@bot.on_message(filters.command("listwithdraw"))
+async def _lw(c, m):
+    await list_withdraw_handler(c, m)
+
+@bot.on_message(filters.command("pay"))
+async def _pay(c, m):
+    await pay_handler(c, m)
+
+@bot.on_message(filters.command("reject"))
+async def _rej(c, m):
+    await reject_handler(c, m)
+
+
+# --- Run bot in background thread ---
+
+def run_bot():
+    bot.run()
+
+
+def start_bot_in_thread():
+    t = threading.Thread(target=run_bot, name="pyrogram-bot", daemon=True)
+    t.start()
+    return t
+
+
+if __name__ == "__main__":
+    start_bot_in_thread()
+    # Start Flask (blocking)
+    app.run(host="0.0.0.0", port=5000)
+
+
+---
+
+10. templates/base.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title if title else 'Watch & Earn' }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>
+
+
+---
+
+11. templates/ad_page.html
+
+{% extends 'base.html' %}
+{% block content %}
+<h2>{{ ad.title }}</h2>
+{% if ad.type == 'video' and ad.video_url %}
+  <video id="adVideo" width="100%" controls playsinline>
+    <source src="{{ ad.video_url }}" type="video/mp4">
+  </video>
+  <p>Watch fully to earn {{ ad.reward_coins }} coins.</p>
+{% elif ad.type == 'link' %}
+  <p>Open the sponsor page below and stay for a bit to earn {{ ad.reward_coins }} coins.</p>
+  <a id="adLink" href="{{ ad.landing_url }}" target="_blank">Open Sponsor</a>
+{% else %}
+  <p>Unknown ad type.</p>
+{% endif %}
+<p id="status"></p>
+<script>
+  const token = {{ token|tojson }};
+  let credited = false;
+
+  function credit(progress){
+    if(credited) return;
+    fetch('/api/credit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: token, progress: progress})
+    }).then(r=>r.json()).then(j=>{
+      if(j.ok){
+        credited = true;
+        document.getElementById('status').innerText = `You earned ${j.reward} coins! You can close this page.`;
+      } else {
+        document.getElementById('status').innerText = 'Not credited: '+j.error;
+      }
+    }).catch(()=>{
+      document.getElementById('status').innerText = 'Network error.';
+    });
+  }
+
+  const vid = document.getElementById('adVideo');
+  if(vid){
+    vid.addEventListener('timeupdate', ()=>{
+      const p = vid.currentTime / vid.duration;
+      if(p >= 0.8){ // 80% watched
+        credit(p);
+      }
+    });
+    vid.addEventListener('ended', ()=>credit(1));
+  }
+
+  const lnk = document.getElementById('adLink');
+  if(lnk){
+    lnk.addEventListener('click', ()=>{
+      // naive 5 second timer credit for link type
+      setTimeout(()=>credit(1), 5000);
+    });
+  }
+</script>
+{% endblock %}
+
+
+---
+
+12. templates/earn_list.html
+
+{% extends 'base.html' %}
+{% block content %}
+<h2>Available Ads</h2>
+<ul>
+  {% for ad in ads %}
+    <li>
+      {{ ad.title }} (+{{ ad.reward_coins }}c)
+      <a href="/watch/{{ user_id }}/{{ ad._id }}">Watch</a>
+    </li>
+  {% endfor %}
+</ul>
+{% endblock %}
+
+
+---
+
+13. templates/admin_ads.html
+
+{% extends 'base.html' %}
+{% block content %}
+<h2>Admin – Ads</h2>
+<table>
+  <tr><th>Title</th><th>Reward</th><th>Active</th><th>Actions</th></tr>
+  {% for ad in ads %}
+  <tr>
+    <td>{{ ad.title }}</td>
+    <td>{{ ad.reward_coins }}</td>
+    <td>{{ 'Yes' if ad.active else 'No' }}</td>
+    <td>
+      {% if ad.active %}
+      <a href="/admin/ads/off/{{ ad._id }}">Disable</a>
+      {% else %}
+      <a href="/admin/ads/on/{{ ad._id }}">Enable</a>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<hr>
+<h3>Add New Ad</h3>
+<form method="post" action="/admin/ads/add">
+  <p>Title: <input name="title"></p>
+  <p>Video URL: <input name="video_url"></p>
+  <p>Reward Coins: <input name="reward" value="5"></p>
+  <button type="submit">Add Ad</button>
+</form>
+{% endblock %}
+
+
+---
+
+14. static/style.css
+
+body { font-family: sans-serif; background:#f7f7f7; margin:0; padding:0; }
+.container { max-width:480px; margin:0 auto; padding:1rem; background:#fff; box-shadow:0 0 5px rgba(0,0,0,0.1); }
+h2 { margin-top:0; }
+video { max-width:100%; height:auto; }
+#status { margin-top:1rem; font-weight:bold; }
+
+
+---
+
+15. requirements.txt
+
+pyrogram==2.0.106
+TgCrypto==1.2.5
+Flask==3.0.3
+pymongo==4.8.0
+python-dotenv==1.0.1
+uvicorn==0.30.1  # optional alt server
+gunicorn==22.0.0 # for production
+
+
+---
+
+16. Procfile (for Heroku-style / Render start command)
+
+web: python main.py
+
+If you want to use Gunicorn + UvicornWorker for better prod serving with async support:
+
+web: gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT --log-level info
+
+> BUT if you do that, you need a separate worker for the bot or start bot before gunicorn pre-fork. A simpler single-process approach is to keep python main.py on free hosting.
+
+
+
+
+---
+
+17. runtime.txt (optional, some hosts)
+
+python-3.12.4
+
+
+---
+
+18. render.yaml (Render deployment example)
+
+services:
+  - type: web
+    name: watch-ads-earn-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: earn_bot
+      - key: SECRET_KEY
+        sync: false
+      - key: ADMIN_IDS
+        value: "123456789,987654321"
+      - key: BASE_URL
+        fromService:
+          name: watch-ads-earn-bot
+          type: web
+          property: url
+
+
+---
+
+19. .env.example
+
+# Copy to .env and fill
+API_ID=123456
+API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+BOT_TOKEN=123456:ABC-DEF_your-bot-token
+MONGO_URI=mongodb+srv://user:pass@cluster0.mongodb.net/?retryWrites=true&w=majority
+MONGO_DB_NAME=earn_bot
+SECRET_KEY=change_this_long_random_string
+ADMIN_IDS=123456789,987654321
+BASE_URL=https://your-app.onrender.com
+FORCE_JOIN_CHANNELS=YourChannel,YourGroup
+COIN_TO_INR=0.10
+DEFAULT_AD_REWARD=5
+DAILY_AD_WATCH_LIMIT=20
+AD_COOLDOWN_SECONDS=60
+MIN_WITHDRAW_COINS=500
+LANG_MODE=auto  # en|hi|auto
+
+
+---
+
+20. README.md
+
+# Watch Ads & Earn – Telegram Bot
+
+Users watch sponsor videos (or open links) to earn coins. Coins can be withdrawn (manual UPI review). Built with **Pyrogram + Flask + MongoDB**. Deploy on Render.
+
+---
+## Features
+- /start registers user
+- Force join channels (optional)
+- /earn shows current ad (video/link)
+- Web ad page credits coins after 80% watch
+- Per-user daily watch limit & cooldown
+- /balance shows current coins & INR approx
+- /withdraw <coins> <UPI> requests payout
+- Admin commands: /adsadmin, /addad, /disablead, /enablead, /listwithdraw, /pay, /reject
+
+---
+## Quick Start (Local)
+1. **Clone repo**
+2. `cp .env.example .env` and fill secrets
+3. `python -m venv venv && source venv/bin/activate` (Linux/macOS) or `venv\Scripts\activate` (Windows)
+4. `pip install -r requirements.txt`
+5. `python main.py`
+6. Open Telegram, send `/start` to your bot.
+7. Send `/addad Test|5|https://path/to/video.mp4` from an admin account.
+8. Send `/earn` from user account → tap button → watch video → earn coins.
+
+---
+## MongoDB Collections
+See `models.py` for schema. Minimal fields; MongoDB flexible.
+
+---
+## Deployment (Render)
+1. Push repo to GitHub.
+2. Create new **Web Service** in Render, pick repo.
+3. Set environment variables per `.env.example`.
+4. Use start command: `python main.py`.
+5. After deploy, copy Render public URL → set `BASE_URL` env → redeploy.
+6. Restart service.
+
+---
+## Security Notes
+- SECRET_KEY must be long random string.
+- Reward token signed; prevents simple spoofing.
+- Still vulnerable to video skip hacks; advanced: use DRM / timed ping.
+- Rate-limit `/api/credit` behind CDN (Cloudflare) if heavy traffic.
+
+---
+## Payments / Compliance Disclaimer
+This code is for **educational purposes**. Real-money reward systems must follow:
+- Ad network TOS (AdMob, AppLovin, etc.)
+- Government/Tax/KYC rules in your country
+- Anti-fraud + anti-spam measures
+- User consent & privacy compliance
+
+---
+## Extend Ideas
+- Referral bonus (invite friends → coins)
+- Tiered ads (high reward for longer video)
+- Leaderboard
+- Auto-check UPI payouts via API (Razorpay/Paytm if allowed)
+- Web dashboard with charts
+
+---
+## Troubleshooting
+**Bot not responding?** Check BOT_TOKEN and that it isn't running elsewhere.
+**Coins not crediting?** Make sure BASE_URL correct & reachable from Telegram.
+**Video not playing on mobile?** Use MP4 (H.264/AAC) over HTTPS.
+**Mongo error?** Whitelist IP / use `0.0.0.0/0` temporarily (dev only).
+
+---
+## License
+MIT – use, modify, share freely. Attribution appreciated.
+
+
+---
+
+21. Quick Single-File Inline Demo (Optional)
+
+If you just want to test very fast without creating all files, copy this into quick_demo.py and run. (Minimal, not production.)
+
+import os
+from flask import Flask, request, render_template_string
+from pyrogram import Client, filters
+from pymongo import MongoClient
+import threading
+
+API_ID=int(os.getenv('API_ID',0))
+API_HASH=os.getenv('API_HASH','')
+BOT_TOKEN=os.getenv('BOT_TOKEN','')
+MONGO_URI=os.getenv('MONGO_URI','mongodb://localhost:27017/')
+BASE_URL=os.getenv('BASE_URL','http://localhost:5000')
+
+mongo=MongoClient(MONGO_URI)
+db=mongo['quickdemo']
+
+app=Flask(__name__)
+
+bot=Client('quickdemo', api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+
+@bot.on_message(filters.command('start'))
+async def st(c,m):
+    if not db.users.find_one({'_id':m.from_user.id}):
+        db.users.insert_one({'_id':m.from_user.id,'coins':0})
+    await m.reply('Use /earn to watch ad.')
+
+@bot.on_message(filters.command('earn'))
+async def earn(c,m):
+    ad=db.ads.find_one({'active':True})
+    if not ad:
+        await m.reply('No ads.')
+        return
+    url=f"{BASE_URL}/demo/{m.from_user.id}/{ad['_id']}"
+    await m.reply(f"{ad['title']} Reward:{ad['reward']}c", reply_markup=dict(inline_keyboard=[[{'text':'Watch','url':url}]]))
+
+@app.route('/demo/<int:uid>/<aid>')
+def demo(uid,aid):
+    ad=db.ads.find_one({'_id':aid}) if isinstance(aid,str) else None
+    if not ad:
+        from bson import ObjectId
+        ad=db.ads.find_one({'_id':ObjectId(aid)})
+    if not ad:
+        return 'missing',404
+    tpl='''<video id=v controls width=320><source src="{{u}}" type=video/mp4></video>\n<p id=s></p>\n<script>v=document.getElementById('v');s=document.getElementById('s');v.addEventListener('ended',()=>{fetch('/cred', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({u:{{uid}},a:"{{aid}}",r:{{r}}})}).then(x=>s.innerText='Credited!');});</script>'''
+    return render_template_string(tpl,u=ad['video'],uid=uid,aid=str(ad['_id']),r=ad['reward'])
+
+@app.post('/cred')
+def cred():
+    j=request.json;uid=j['u'];r=j['r'];db.users.update_one({'_id':uid},{'$inc':{'coins':r}})
+    return {'ok':True}
+
+def run_bot():
+    bot.run()
+
+if __name__=='__main__':
+    if not db.ads.find_one():
+        db.ads.insert_one({'title':'Demo Ad','video':'https://file-examples.com/storage/fe6d.../file_example_MP4_480_1_5MG.mp4','reward':5,'active':True})
+    threading.Thread(target=run_bot,daemon=True).start()
+    app.run(host='0.0.0.0',port=5000)
+
+
+---
+
+✅ What To Do Next
+
+1. Fill in .env with your actual API_ID, API_HASH, BOT_TOKEN, Mongo URI, etc.
+
+
+2. Install deps & run python main.py.
+
+
+3. From your admin Telegram account, run /addad Demo|5|<video_url>.
+
+
+4. From user account, run /earn and test that coins credit.
+
+
+
+Bas! Aapka Ad Dekho – Paisa Kamao bot chalu ho jayega. 😎💰
+
+
+---
+
+Agar aap chaho to main ab turant:
+
+Render deploy steps ko line-by-line screenshot style mein likh sakta hoon,
+
+Ya code ka minimal ZIP banane ke liye user-visible Python session chala sakta hoon.
+
+
+Mujhe batayein: "Deploy Guide do" ya "ZIP banao" ya koi dusra change.
+
